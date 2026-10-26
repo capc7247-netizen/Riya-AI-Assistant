@@ -13,11 +13,11 @@ import java.util.Locale
  * Ria ka AI. Google Search se judta hai, isliye mausam, khabar, score, bhav
  * jaise taaza sawalon ka bhi jawab deta hai.
  *
- * API key yahan daalo (ya prefs "ria_prefs" mein "gemini_api_key" naam se).
+ * API key Settings screen se daalo (prefs "ria_prefs" mein "api_key" naam se save hoti hai).
  */
 object GeminiClient {
 
-    // <-- yahan apni Gemini API key daalo (https://aistudio.google.com se milti hai)
+    // Key yahan mat likho, repo public hai. Settings screen se daalo.
     private const val API_KEY = ""
 
     // pehla model na mile to doosra try hoga
@@ -38,9 +38,12 @@ object GeminiClient {
     }
 
     private fun apiKey(context: Context): String {
-        val saved = context.getSharedPreferences("ria_prefs", Context.MODE_PRIVATE)
-            .getString("gemini_api_key", "") ?: ""
-        return if (saved.trim().isNotEmpty()) saved.trim() else API_KEY.trim()
+        val prefs = context.getSharedPreferences("ria_prefs", Context.MODE_PRIVATE)
+        val fromSettings = (prefs.getString("api_key", "") ?: "").trim()
+        if (fromSettings.isNotEmpty()) return fromSettings
+        val old = (prefs.getString("gemini_api_key", "") ?: "").trim()
+        if (old.isNotEmpty()) return old
+        return API_KEY.trim()
     }
 
     private fun systemText(context: Context): String {
@@ -64,7 +67,7 @@ object GeminiClient {
     private fun call(context: Context, question: String): String {
         val key = apiKey(context)
         if (key.isEmpty()) {
-            return "API की नहीं मिली, GeminiClient.kt में अपनी Gemini API की डालिए"
+            return "API की नहीं मिली, Settings में अपनी Gemini API की डालकर सेव कीजिए"
         }
 
         val contents = JSONArray()
@@ -118,6 +121,7 @@ object GeminiClient {
                     lastProblem = "जवाब नहीं बन पाया, सवाल दूसरे तरीके से पूछिए"
                     return lastProblem
                 }
+
                 when (code) {
                     400, 401, 403 -> return "API की सही नहीं है या चालू नहीं है, कोड $code"
                     429 -> return "AI की मुफ़्त लिमिट पूरी हो गई, थोड़ी देर बाद कोशिश कीजिए"
