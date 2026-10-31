@@ -9,6 +9,10 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.net.ConnectivityManager
@@ -46,13 +50,24 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         private const val DEBUG_TOASTS = true
         private const val CHANNEL_ID = "ria_assistant_channel"
         private const val NOTIFICATION_ID = 1
-        private const val CONVERSATION_TIMEOUT_MS = 15000L
+        private const val CONVERSATION_TIMEOUT_MS = 10000L
         private const val MODEL_DIR_NAME = "model_hi"
+
+        private const val PKG_YT = "com.google.android.youtube"
+        private const val PKG_YTM = "com.google.android.apps.youtube.music"
+        private const val PKG_SPOTIFY = "com.spotify.music"
+        private const val PKG_FB = "com.facebook.katana"
 
         // Hindi model devanagari mein likhta hai, isliye dono tarah ke shabd rakhe hain
         private val WAKE_WORDS = listOf(
             "हे रिया", "हेय रिया", "ए रिया", "हे रीया", "हे रिआ",
             "रिया", "रीया", "रिआ",
+            "hey ria", "hey riya"
+        )
+
+        // video/gaana chal raha ho to sirf ye poore shabd maane jaayenge
+        private val STRICT_WAKE_WORDS = listOf(
+            "हे रिया", "हेय रिया", "ए रिया", "हे रीया", "हे रिआ",
             "hey ria", "hey riya"
         )
     }
@@ -70,6 +85,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     private var glow: EdgeGlowOverlay? = null
     private var askedOverlayPermission = false
     private var consecutiveErrors = 0
+    private var focusRequest: AudioFocusRequest? = null
 
     // internet na ho to Vosk se hi command suno
     @Volatile
@@ -124,11 +140,86 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         return tokens(text).filter { it !in words }.joinToString(" ")
     }
 
+    private fun cut(text: String, max: Int): String {
+        if (text.length <= max) return text
+        val part = text.substring(0, max)
+        val end = maxOf(part.lastIndexOf('.'), part.lastIndexOf('।'), part.lastIndexOf('?'))
+        return if (end > 80) part.substring(0, end + 1) else part
+    }
+
     private fun debugToast(prefix: String, text: String) {
         if (!DEBUG_TOASTS) return
         mainHandler.post {
             Toast.makeText(applicationContext, "$prefix: $text", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    // ---------------- audio: kaun si awaaz se bolna hai ----------------
+
+    // Jis awaaz-stream ki volume chalu ho usi se bolo; sab band hon to alarm stream chalu kar do
+    private fun pickSpeechStream(): Int {
+        val audio = getSystemService(AudioManager::class.java) ?: return AudioManager.STREAM_MUSIC
+        val streams = listOf(
+            AudioManager.STREAM_MUSIC,
+            AudioManager.STREAM_ALARM,
+            AudioManager.STREAM_NOTIFICATION,
+            AudioManager.STREAM_RING,
+            AudioManager.STREAM_SYSTEM
+        )
+        for (s in streams) {
+            try {
+                if (audio.getStreamVolume(s) > 0) return s
+            } catch (e: Exception) {
+            }
+        }
+        try {
+            val max = audio.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+            audio.setStreamVolume(AudioManager.STREAM_ALARM, (max * 0.6).toInt().coerceAtLeast(1), 0)
+        } catch (e: Exception) {
+        }
+        return AudioManager.STREAM_ALARM
+    }
+
+    // Bolte waqt video/gaane ki aawaaz dheemi ho, band na ho
+    private fun requestDuckFocus() {
+        val audio = getSystemService(AudioManager::class.java) ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .build()
+                focusRequest = req
+                audio.requestAudioFocus(req)
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun releaseDuckFocus() {
+        val audio = getSystemService(AudioManager::class.java) ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                focusRequest?.let { audio.abandonAudioFocusRequest(it) }
+            }
+            focusRequest = null
+        } catch (e: Exception) {
+        }
+    }
+
+    // Video/gaane ki aawaaz se na jaage: wake word chhote vaakya mein ho,
+    // aur media chal raha ho to sirf "हे रिया" jaisa poora shabd, wo bhi final result par
+    private fun isRealWakeCall(heard: String, isFinal: Boolean): Boolean {
+        if (tokens(heard).size > 3) return false
+        val audio = getSystemService(AudioManager::class.java)
+        if (audio != null && audio.isMusicActive) {
+            return isFinal && containsAny(heard, STRICT_WAKE_WORDS)
+        }
+        return true
     }
 
     // ---------------- lifecycle ----------------
@@ -139,6 +230,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         overlay = OverlayManager(this)
         overlay?.onClose = { mainHandler.post { endConversationMode() } }
         glow = EdgeGlowOverlay(this)
+        glow?.onMicTap = { mainHandler.post { onMicTapped() } }
 
         createNotificationChannel()
         val notif = buildNotification("सुन रही हूँ... (हे रिया बोलिए)")
@@ -163,9 +255,9 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // AssistActivity (power button) se seedha shuru karna ho to "start_conversation" extra bhejo
+        // AssistActivity (power button) se seedha shuru: greeting nahi, sirf mic
         if (intent?.getBooleanExtra("start_conversation", false) == true) {
-            mainHandler.post { onWakeWordDetected() }
+            mainHandler.post { onWakeWordDetected(false) }
         }
         return START_STICKY
     }
@@ -178,6 +270,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         mainHandler.removeCallbacks(voskWatchdog)
         overlay?.hide()
         glow?.hide()
+        releaseDuckFocus()
         voskHandler.post {
             stopVoskInternal()
             try {
@@ -277,6 +370,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     private fun onSpeechFinished() {
         isSpeaking = false
         mainHandler.post {
+            releaseDuckFocus()
+            glow?.setMode(EdgeGlowOverlay.MODE_LISTENING)
             if (endAfterSpeech) {
                 endAfterSpeech = false
                 if (isInConversationMode) endConversationMode()
@@ -294,16 +389,40 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         mainHandler.post {
             debugToast("बोल रही हूँ", text)
             overlay?.setReply(text)
+            glow?.setMode(EdgeGlowOverlay.MODE_SPEAKING)
             try {
                 speechRecognizer?.cancel()
             } catch (e: Exception) {
             }
-            val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "ria_utterance")
+            val params = Bundle()
+            params.putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, pickSpeechStream())
+            requestDuckFocus()
+            val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "ria_utterance")
             if (result != TextToSpeech.SUCCESS) {
                 isSpeaking = false
+                releaseDuckFocus()
+                glow?.setMode(EdgeGlowOverlay.MODE_LISTENING)
                 if (isInConversationMode) restartListening()
             }
         }
+    }
+
+    // Gole mic button dabane par: bolna ruke aur turant sunna shuru
+    private fun onMicTapped() {
+        if (!isInConversationMode) {
+            onWakeWordDetected(false)
+            return
+        }
+        try {
+            tts?.stop()
+        } catch (e: Exception) {
+        }
+        isSpeaking = false
+        endAfterSpeech = false
+        releaseDuckFocus()
+        glow?.setMode(EdgeGlowOverlay.MODE_LISTENING)
+        scheduleTimeout()
+        restartListeningNow()
     }
 
     // ---------------- overlay (glow ya card) ----------------
@@ -477,8 +596,8 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 lastToastTime = now
                 debugToast("Vosk", heard)
             }
-            if (containsAny(heard, WAKE_WORDS)) {
-                onWakeWordDetected()
+            if (containsAny(heard, WAKE_WORDS) && isRealWakeCall(heard, key == "text")) {
+                onWakeWordDetected(true)
             }
         } catch (e: Exception) {
         }
@@ -501,7 +620,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         processCommand(rest)
     }
 
-    private fun onWakeWordDetected() {
+    private fun onWakeWordDetected(withGreeting: Boolean = true) {
         if (isInConversationMode) return
         isInConversationMode = true
         consecutiveErrors = 0
@@ -512,7 +631,11 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             // online: Google recognizer se command, uske liye Vosk band
             voskCommandMode = false
             stopVosk()
-            speak("जी बोलिए")
+            if (withGreeting) {
+                speak("जी बॉस, बोलिए क्या काम है")
+            } else {
+                restartListening() // sirf mic ki aawaaz
+            }
         } else {
             // internet nahi: Vosk chalta rahe, wahi command sunega
             voskCommandMode = true
@@ -539,14 +662,19 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             speechRecognizer?.cancel()
         } catch (e: Exception) {
         }
+        glow?.setMode(EdgeGlowOverlay.MODE_LISTENING)
         hideOverlayUi()
+        releaseDuckFocus()
         updateNotification("सुन रही हूँ... (हे रिया बोलिए)")
-        startVosk(1200)
+        startVosk(1800)
     }
 
+    // 10 second mein kuch na bola to apne aap band (bolte/sochte waqt band nahi hota)
     private fun scheduleTimeout() {
         timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
-        val runnable = Runnable { endConversationMode() }
+        val runnable = Runnable {
+            if (isSpeaking) scheduleTimeout() else endConversationMode()
+        }
         timeoutRunnable = runnable
         mainHandler.postDelayed(runnable, CONVERSATION_TIMEOUT_MS)
     }
@@ -569,24 +697,23 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                     overlay?.setUserText(spoken)
                     scheduleTimeout()
                     processCommand(spoken)
+                    // command ke baad Ria na bole to bhi mic dobara na khule
+                    if (!isSpeaking && isInConversationMode) endConversationMode()
+                } else if (isInConversationMode && !isSpeaking) {
+                    endConversationMode()
                 }
-                if (!isSpeaking && isInConversationMode) restartListening()
             }
 
             override fun onError(error: Int) {
                 if (!isInConversationMode || isSpeaking) return
                 when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                        consecutiveErrors++
-                        if (consecutiveErrors >= 3) endConversationMode() else restartListening()
+                        // kuch nahi bola / samajh nahi aaya: mic dobara nahi, seedha band
+                        endConversationMode()
                     }
                     SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
                         consecutiveErrors++
-                        if (consecutiveErrors >= 4) {
-                            endConversationMode()
-                        } else {
-                            mainHandler.postDelayed({ restartListeningNow() }, 900)
-                        }
+                        if (consecutiveErrors >= 2) endConversationMode() else restartListening()
                     }
                     else -> {
                         // network / server / language / permission: loop mat chalao
@@ -597,9 +724,16 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
                 }
             }
 
-            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onReadyForSpeech(params: Bundle?) {
+                glow?.setMode(EdgeGlowOverlay.MODE_LISTENING)
+            }
+
             override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
+
+            override fun onRmsChanged(rmsdB: Float) {
+                glow?.setLevel(rmsdB)
+            }
+
             override fun onBufferReceived(buffer: ByteArray?) {}
             override fun onEndOfSpeech() {}
             override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -624,6 +758,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     private fun restartListeningNow() {
         if (!isInConversationMode || isSpeaking) return
         overlay?.setStatus("सुन रही हूँ...")
+        glow?.setMode(EdgeGlowOverlay.MODE_LISTENING)
         try {
             listenOnce()
         } catch (e: Exception) {
@@ -632,30 +767,12 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
 
     // ---------------- commands ----------------
 
-    private val CALL_WORDS = listOf("call", "कॉल", "कोल", "फोन", "फ़ोन", "phone")
     private val MESSAGE_TOKENS = setOf("message", "sms", "msg", "मैसेज", "मेसेज", "एसएमएस")
     private val WHATSAPP_TOKENS = setOf(
         "whatsapp", "व्हाट्सएप", "व्हाट्सअप", "वॉट्सएप", "वाट्सएप", "व्हाट्स"
     )
-    private val ALARM_WORDS = listOf("alarm", "अलार्म", "अलारम")
-    private val OPEN_WORDS = listOf("open", "kholo", "खोलो", "ओपन", "खोल")
-    private val TIME_WORDS = listOf("time", "समय", "टाइम", "बजे हैं")
-    private val SCREEN_WORDS = listOf(
-        "screen analyse", "screen analyze", "screen analysis",
-        "स्क्रीन एनालाइज", "स्क्रीन पढ़ो", "स्क्रीन देखो", "padho",
-        "स्क्रीन पर क्या", "स्क्रीन पे क्या", "screen par kya", "screen pe kya", "इसे समझाओ",
-        "एनालिसिस", "एनालाइसिस", "एनालाइज़", "एनालाइज", "analysis", "analyse", "analyze",
-        "विश्लेषण", "स्क्रीन देख", "स्क्रीन समझा", "स्क्रीन बता", "screen dekho", "screen padho"
-    )
-    private val CLICK_WORDS = listOf("click", "क्लिक", "dabao", "दबाओ", "tap")
-    private val HOME_WORDS = listOf("home screen", "होम स्क्रीन", "होम")
     private val BACK_WORDS = listOf("back karo", "पीछे", "बैक")
     private val CLOSE_WORDS = listOf("close karo", "band karo", "बंद करो")
-    private val MUSIC_WORDS = listOf(
-        "gaana bajao", "gana bajao", "song bajao", "music bajao",
-        "गाना बजाओ", "गाना चलाओ", "गाना लगाओ", "गाना चला", "song play", "play karo",
-        "बजाओ", "बजा दो", "bajao", "bajaao", "play song", "play the song"
-    )
 
     private val CALL_NOISE = setOf(
         "call", "कॉल", "कोल", "phone", "फोन", "फ़ोन", "लगाओ", "लगा", "मिलाओ", "do", "दो",
@@ -667,7 +784,10 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     )
     private val MUSIC_NOISE = setOf(
         "gaana", "gana", "गाना", "song", "music", "bajao", "बजाओ", "चलाओ", "लगाओ", "play",
-        "karo", "करो", "kar", "do", "दो", "spotify", "स्पॉटिफाई", "par", "पर", "पे", "on", "ko", "को"
+        "karo", "करो", "kar", "do", "दो", "spotify", "स्पॉटिफाई", "par", "पर", "पे", "on", "ko", "को",
+        "प्ले", "सुनाओ", "बजा", "गाने", "chalao", "सॉन्ग", "म्यूजिक", "म्यूज़िक", "यूट्यूब", "youtube",
+        "फेसबुक", "facebook", "ytmusic", "yt", "यू", "ट्यूब", "से", "में", "खोलकर", "चलाइए",
+        "बजाइए", "please", "कृपया", "लगा"
     )
     private val CLICK_NOISE = setOf(
         "click", "क्लिक", "dabao", "दबाओ", "tap", "karo", "करो", "kar", "upar", "ऊपर", "पर", "par", "ko", "को"
@@ -688,15 +808,42 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
     private val CALL_TOKENS = setOf("call", "कॉल", "कोल")
     private val CALL_AUX = setOf("फोन", "फ़ोन", "phone")
     private val CALL_VERBS = setOf("लगाओ", "लगा", "करो", "मिलाओ", "लगाइए", "karo")
-    private val MUSIC_TOKENS = setOf("गाना", "गाने", "song", "music", "gaana", "gana", "सॉन्ग", "म्यूजिक")
+    private val MUSIC_TOKENS = setOf("गाना", "गाने", "song", "music", "gaana", "gana", "सॉन्ग", "म्यूजिक", "म्यूज़िक")
     private val PLAY_TOKENS = setOf("बजाओ", "bajao", "bajaao", "चलाओ", "chalao", "लगाओ", "play", "प्ले", "बजा", "सुनाओ")
     private val SCREEN_PART = listOf("स्क्रीन", "screen", "सक्रीन")
     private val SCREEN_ACTION = listOf(
         "एनाल", "analy", "पढ़", "पढ", "देख", "समझा", "बता", "क्या", "dekho", "padho", "kya", "read", "explain", "describe"
     )
 
+    private val ON_TOKENS = setOf("चालू", "चालु", "on", "ऑन", "शुरू", "जलाओ", "जला")
+    private val OFF_TOKENS = setOf("बंद", "बन्द", "off", "ऑफ", "बुझाओ", "बुझा")
+
+    private val NAME_QUESTIONS = listOf(
+        "तुम्हारा नाम", "तेरा नाम", "आपका नाम", "तुम कौन", "आप कौन", "तू कौन",
+        "your name", "who are you", "tumhara naam", "tera naam", "aapka naam"
+    )
+    private val FORGET_WORDS = listOf(
+        "सब भूल जाओ", "सब कुछ भूल जाओ", "भूल जाओ सब", "forget everything", "मेमोरी साफ", "याददाश्त मिटा"
+    )
+    private val RECALL_WORDS = listOf(
+        "क्या याद है", "मेरे बारे में क्या", "what do you remember", "kya yaad hai"
+    )
+    private val REMEMBER_WORDS = listOf(
+        "याद रखो", "याद रखना", "याद कर लो", "yaad rakho", "remember that", "remember this"
+    )
+
     private fun hasTok(parts: List<String>, words: Set<String>): Boolean {
         return parts.any { it in words }
+    }
+
+    // true = chalu, false = band, null = pata nahi
+    private fun wantOn(parts: List<String>): Boolean? {
+        if (hasTok(parts, OFF_TOKENS)) return false
+        if (hasTok(parts, ON_TOKENS)) return true
+        if (containsAny(parts.joinToString(" "), listOf("चालू", "बंद"))) {
+            return !parts.joinToString(" ").contains("बंद")
+        }
+        return null
     }
 
     private fun processCommand(command: String) {
@@ -705,8 +852,26 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         when {
             containsAny(command, listOf("ग्लो मोड", "glow mode", "लाइट मोड")) -> setOverlayMode("glow")
             containsAny(command, listOf("कार्ड मोड", "card mode", "बॉक्स मोड")) -> setOverlayMode("card")
+            parts.size <= 6 && containsAny(command, NAME_QUESTIONS) ->
+                speak("मेरा नाम रिया है, मैं आपकी असिस्टेंट हूँ")
+            containsAny(command, FORGET_WORDS) -> {
+                GeminiClient.clearMemory(applicationContext)
+                speak("ठीक है, सब भूल गई")
+            }
+            containsAny(command, RECALL_WORDS) -> recallMemories()
+            containsAny(command, REMEMBER_WORDS) -> rememberCommand(command)
             containsAny(command, listOf("मेरा शहर", "my city")) -> saveCity(command)
             containsAny(command, SCREEN_PART) && containsAny(command, SCREEN_ACTION) -> readScreenContent()
+            containsAny(command, listOf("टॉर्च", "torch", "flashlight", "फ्लैशलाइट", "फ्लैश लाइट")) ->
+                handleTorch(wantOn(parts))
+            containsAny(command, listOf("वाईफाई", "वाई-फाई", "वाई फाई", "wifi", "wi-fi", "वाईफ़ाई", "वाई फ़ाई")) &&
+                wantOn(parts) != null -> toggleViaSettings("वाई-फ़ाई", wantOn(parts) == true, false)
+            containsAny(command, listOf("ब्लूटूथ", "bluetooth", "ब्लूटुथ")) &&
+                wantOn(parts) != null -> toggleViaSettings("ब्लूटूथ", wantOn(parts) == true, true)
+            containsAny(command, listOf("आवाज़ बढ़ा", "आवाज बढ़ा", "वॉल्यूम बढ़ा", "volume up", "आवाज़ तेज", "आवाज तेज")) ->
+                changeVolume(true)
+            containsAny(command, listOf("आवाज़ घटा", "आवाज घटा", "वॉल्यूम घटा", "volume down", "आवाज़ कम", "आवाज कम", "वॉल्यूम कम")) ->
+                changeVolume(false)
             short && hasTok(parts, CLICK_TOKENS) -> {
                 val target = removeWords(command, CLICK_NOISE)
                 if (target.isNotEmpty()) clickOnScreenElement(target)
@@ -716,7 +881,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             short && containsAny(command, BACK_WORDS) -> goBackScreen()
             short && containsAny(command, CLOSE_WORDS) -> closeCurrentApp()
             isMusicCommand(command, parts) -> {
-                playMusicOnSpotify(removeWords(command, MUSIC_NOISE + setOf("प्ले", "सुनाओ", "बजा", "गाने", "chalao", "सॉन्ग", "म्यूजिक")))
+                playMusic(removeWords(command, MUSIC_NOISE), musicAppHint(command))
             }
             hasTok(parts, WHATSAPP_TOKENS) && (hasTok(parts, MESSAGE_TOKENS) || hasTok(parts, SEND_TOKENS)) -> {
                 val (name, message) = splitNameAndMessage(command, WHATSAPP_TOKENS)
@@ -750,10 +915,45 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun musicAppHint(command: String): String {
+        return when {
+            containsAny(command, listOf("यूट्यूब म्यूजिक", "यूट्यूब म्यूज़िक", "youtube music", "yt music")) -> "ytmusic"
+            containsAny(command, listOf("यूट्यूब", "youtube", "यू ट्यूब")) -> "youtube"
+            containsAny(command, listOf("फेसबुक", "facebook")) -> "facebook"
+            containsAny(command, listOf("स्पॉटिफाई", "spotify")) -> "spotify"
+            else -> ""
+        }
+    }
+
     private fun isMusicCommand(command: String, parts: List<String>): Boolean {
         if (containsAny(command, listOf("गाना बजाओ", "गाना चलाओ", "गाना लगाओ", "gaana bajao", "gana bajao", "song bajao"))) return true
         if (parts.isNotEmpty() && parts[0] in setOf("play", "प्ले")) return parts.size <= 8
-        return parts.size <= 8 && hasTok(parts, MUSIC_TOKENS) && hasTok(parts, PLAY_TOKENS)
+        if (parts.size > 10) return false
+        val hasPlay = hasTok(parts, PLAY_TOKENS)
+        return hasPlay && (hasTok(parts, MUSIC_TOKENS) || musicAppHint(command).isNotEmpty())
+    }
+
+    // ---------------- memory (yaaddaasht) ----------------
+
+    private fun rememberCommand(command: String) {
+        var rest = command
+        for (w in REMEMBER_WORDS) rest = rest.replace(w, " ")
+        rest = tokens(rest).joinToString(" ")
+        if (rest.isEmpty()) {
+            speak("क्या याद रखना है, बोलिए")
+            return
+        }
+        GeminiClient.addMemory(applicationContext, rest)
+        speak("ठीक है, याद रख लिया")
+    }
+
+    private fun recallMemories() {
+        val list = GeminiClient.memoryList(applicationContext)
+        if (list.isEmpty()) {
+            speak("अभी मुझे आपके बारे में कुछ याद नहीं है")
+        } else {
+            speak("मुझे याद है: " + cut(list.takeLast(6).joinToString(". "), 380))
+        }
     }
 
     private fun saveCity(command: String) {
@@ -767,23 +967,25 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         speak("ठीक है, आपका शहर $rest याद रख लिया")
     }
 
-    private fun askAiAndSpeak(question: String, fallbackText: String? = null) {
+    private fun askAiAndSpeak(question: String, fallbackText: String? = null, remember: Boolean = true) {
         if (!isOnline()) {
-            speak("इंटरनेट नहीं है, यह सवाल ऑनलाइन ही हो पाएगा")
+            if (fallbackText != null) speak(cut(fallbackText, 400))
+            else speak("इंटरनेट नहीं है, यह सवाल ऑनलाइन ही हो पाएगा")
             return
         }
         isSpeaking = true // jawab aane tak mic band rakho
         overlay?.setStatus("सोच रही हूँ...")
-        GeminiClient.ask(applicationContext, question) { answer ->
+        glow?.setMode(EdgeGlowOverlay.MODE_THINKING)
+        GeminiClient.ask(applicationContext, question, remember) { answer, error ->
             mainHandler.post {
-                if (answer != null && answer.trim().isNotEmpty()) {
-                    val shortAnswer = if (answer.length > 400) answer.substring(0, 400) else answer
-                    speak(shortAnswer)
+                val good = answer?.trim() ?: ""
+                if (good.isNotEmpty()) {
+                    speak(cut(good, 400))
                 } else if (fallbackText != null) {
-                    // AI na mile to screen ka text seedha padh do
-                    speak(if (fallbackText.length > 400) fallbackText.substring(0, 400) else fallbackText)
+                    // AI na chale to screen ka text seedha padh do
+                    speak("AI अभी नहीं चला, स्क्रीन पर यह लिखा है: " + cut(fallbackText, 330))
                 } else {
-                    speak("AI से जवाब नहीं मिल पाया, API key और इंटरनेट देखिए")
+                    speak(error ?: "AI से जवाब नहीं मिल पाया, चाबी और इंटरनेट देखिए")
                 }
             }
         }
@@ -889,7 +1091,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // ---------------- alarm / apps / music ----------------
+    // ---------------- alarm / apps ----------------
 
     private fun hasToken(text: String, word: String): Boolean {
         return tokens(text).contains(word)
@@ -967,32 +1169,80 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    private val MUSIC_PACKAGES = listOf("com.spotify.music", "com.google.android.apps.youtube.music")
+    // ---------------- gaana: ऐप खोलो, ढूँढो, पहला रिज़ल्ट दबाओ, चेक करो ----------------
 
-    // Gaana khoj kar seedha chalana: Spotify -> YouTube Music -> Spotify search page par tap
-    private fun playMusicOnSpotify(song: String) {
+    private fun isMusicPlaying(): Boolean {
+        val audio = getSystemService(AudioManager::class.java)
+        return audio != null && audio.isMusicActive
+    }
+
+    private fun playMusic(song: String, appHint: String) {
         if (song.isEmpty()) {
             speak("कौन सा गाना बजाना है, नाम बताइए")
             return
         }
         endAfterSpeech = true // gaana chalte waqt mic band, warna gaana hi command samajh lega
-        speak("$song बजा रही हूँ")
-        tryPlayFromSearch(song, 0)
+        speak("$song ढूँढ रही हूँ")
+        val order = when (appHint) {
+            "ytmusic" -> listOf("ytmusic", "youtube")
+            "youtube" -> listOf("youtube", "ytmusic")
+            "facebook" -> listOf("facebook", "youtube")
+            "spotify" -> listOf("spotify", "ytmusic", "youtube")
+            else -> listOf("ytmusic", "youtube", "spotify")
+        }
+        tryMusicApp(song, order, 0)
     }
 
-    private fun tryPlayFromSearch(song: String, index: Int) {
-        if (index >= MUSIC_PACKAGES.size) {
-            fallbackSpotifySearch(song)
+    private fun tryMusicApp(song: String, order: List<String>, index: Int) {
+        if (index >= order.size) {
+            if (RiaAccessibilityService.instance == null) {
+                speak("गाना शुरू नहीं हो पाया, रिया की एक्सेसिबिलिटी चालू कीजिए")
+            } else {
+                speak("गाना शुरू नहीं हो पाया, ऐप में खुद दबाना पड़ेगा")
+            }
             return
         }
-        if (!launchPlayFromSearch(MUSIC_PACKAGES[index], song)) {
-            tryPlayFromSearch(song, index + 1)
+        val app = order[index]
+        val opened = when (app) {
+            "ytmusic" -> launchPlayFromSearch(PKG_YTM, song)
+            "spotify" -> launchPlayFromSearch(PKG_SPOTIFY, song)
+            "youtube" -> openYoutubeSearch(song)
+            "facebook" -> openAppByPackage(PKG_FB)
+            else -> false
+        }
+        if (!opened) {
+            tryMusicApp(song, order, index + 1)
             return
         }
-        mainHandler.postDelayed({
-            val audio = getSystemService(AudioManager::class.java)
-            if (audio == null || !audio.isMusicActive) tryPlayFromSearch(song, index + 1)
-        }, 6000)
+        mainHandler.postDelayed({ if (!isMusicPlaying()) pressPlayInApp(app, song, 0) }, 5500)
+        mainHandler.postDelayed({ if (!isMusicPlaying()) pressPlayInApp(app, song, 1) }, 9500)
+        mainHandler.postDelayed({ if (!isMusicPlaying()) tryMusicApp(song, order, index + 1) }, 14500)
+    }
+
+    private fun openYoutubeSearch(song: String): Boolean {
+        return try {
+            val intent = Intent(
+                Intent.ACTION_VIEW,
+                Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(song))
+            )
+            intent.setPackage(PKG_YT)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun openAppByPackage(pkg: String): Boolean {
+        return try {
+            val launch = packageManager.getLaunchIntentForPackage(pkg) ?: return false
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(launch)
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun launchPlayFromSearch(pkg: String, song: String): Boolean {
@@ -1009,17 +1259,33 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun fallbackSpotifySearch(song: String) {
-        val audio = getSystemService(AudioManager::class.java)
-        if (audio != null && audio.isMusicActive) return
-        try {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("spotify:search:" + Uri.encode(song)))
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(intent)
-        } catch (e: Exception) {
-            return
+    // attempt 0 = pehli koshish, attempt 1 = doosri (zyada zor se)
+    private fun pressPlayInApp(app: String, song: String, attempt: Int) {
+        val service = RiaAccessibilityService.instance ?: return
+        when (app) {
+            "youtube" -> {
+                val ok = service.clickFirstVideoResult()
+                if (!ok && attempt == 1) {
+                    val dm = resources.displayMetrics
+                    service.tapAt(dm.widthPixels / 2f, dm.heightPixels * 0.36f)
+                }
+            }
+            "ytmusic" -> {
+                if (!service.clickByDescAny(listOf("play", "चलाएं", "चलाएँ", "प्ले"))) {
+                    for (word in tokens(song)) {
+                        if (service.clickByText(word)) break
+                    }
+                }
+            }
+            "spotify" -> tapFirstSpotifyResult(song)
+            "facebook" -> {
+                if (attempt == 0) {
+                    service.submitSearch(song)
+                } else {
+                    service.clickFirstVideoResult()
+                }
+            }
         }
-        mainHandler.postDelayed({ tapFirstSpotifyResult(song) }, 4000)
     }
 
     private fun tapFirstSpotifyResult(song: String) {
@@ -1042,14 +1308,110 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    // ---------------- settings apne aap chalu/band ----------------
+
+    private fun handleTorch(on: Boolean?) {
+        val turnOn = on ?: true
+        val ok = try {
+            val cm = getSystemService(CameraManager::class.java)
+            val id = cm.cameraIdList.firstOrNull {
+                cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            }
+            if (id == null) {
+                false
+            } else {
+                cm.setTorchMode(id, turnOn)
+                true
+            }
+        } catch (e: Exception) {
+            false
+        }
+        if (ok) speak(if (turnOn) "टॉर्च चालू कर दी" else "टॉर्च बंद कर दी")
+        else speak("टॉर्च नहीं चल पाई")
+    }
+
+    private fun changeVolume(up: Boolean) {
+        val audio = getSystemService(AudioManager::class.java)
+        if (audio == null) {
+            speak("आवाज़ नहीं बदल पाई")
+            return
+        }
+        try {
+            for (i in 0 until 3) {
+                audio.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
+                    if (i == 2) AudioManager.FLAG_SHOW_UI else 0
+                )
+            }
+            speak(if (up) "आवाज़ बढ़ा दी" else "आवाज़ कम कर दी")
+        } catch (e: Exception) {
+            speak("आवाज़ नहीं बदल पाई")
+        }
+    }
+
+    // Wi-Fi / Bluetooth: Android seedha chalu nahi karne deta, isliye panel kholkar switch dabate hain
+    private fun toggleViaSettings(label: String, on: Boolean, bluetooth: Boolean) {
+        requireAccessibility() ?: return
+        val intent = when {
+            bluetooth -> Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
+            Build.VERSION.SDK_INT >= 29 -> Intent(Settings.Panel.ACTION_WIFI)
+            else -> Intent(Settings.ACTION_WIFI_SETTINGS)
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            speak("$label की सेटिंग नहीं खुल पाई")
+            return
+        }
+        mainHandler.postDelayed({
+            val ok = RiaAccessibilityService.instance?.setFirstSwitch(on) ?: false
+            mainHandler.postDelayed({ RiaAccessibilityService.instance?.goBack() }, 900)
+            endAfterSpeech = true
+            speak(
+                if (ok) "$label " + (if (on) "चालू" else "बंद") + " कर दिया"
+                else "$label का स्विच नहीं मिला"
+            )
+        }, 2000)
+    }
+
     // ---------------- ACCESSIBILITY wale kaam ----------------
+
+    // Agar adb se WRITE_SECURE_SETTINGS mil chuki hai to Ria khud accessibility chalu kar leti hai
+    private fun tryEnableAccessibility(): Boolean {
+        if (checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS") != PackageManager.PERMISSION_GRANTED) {
+            return false
+        }
+        return try {
+            val comp = "$packageName/" + RiaAccessibilityService::class.java.name
+            val old = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+            if (!old.contains(comp)) {
+                val now = if (old.isEmpty()) comp else "$old:$comp"
+                Settings.Secure.putString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, now)
+            }
+            Settings.Secure.putInt(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 1)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
 
     private fun requireAccessibility(): RiaAccessibilityService? {
         val service = RiaAccessibilityService.instance
-        if (service == null) {
-            speak("पहले सेटिंग्स में रिया की एक्सेसिबिलिटी अनुमति चालू कीजिए")
+        if (service != null) return service
+        if (tryEnableAccessibility()) {
+            speak("एक्सेसिबिलिटी चालू कर दी, अब दोबारा बोलिए")
+            return null
         }
-        return service
+        try {
+            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } catch (e: Exception) {
+        }
+        speak("एक्सेसिबिलिटी बंद है, सेटिंग खोल दी, उसमें रिया चालू कर दीजिए")
+        return null
     }
 
     private fun clickOnScreenElement(target: String) {
@@ -1088,7 +1450,7 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // Online: screen ka text AI ko bhejo, jawab bolo. Offline: screen ka text seedha padh do.
+    // Online: screen ka text AI ko bhejo, jawab bolo. AI na chale ya offline ho to screen ka text seedha padh do.
     private fun readScreenContent() {
         val service = requireAccessibility() ?: return
         val screenText = service.getScreenText()
@@ -1101,11 +1463,11 @@ class VoiceAssistantService : Service(), TextToSpeech.OnInitListener {
             askAiAndSpeak(
                 "मेरी फ़ोन स्क्रीन पर यह लिखा है:\n" + limited +
                     "\n\nइसे हिंदी में बहुत छोटे में समझाओ कि स्क्रीन पर क्या है।",
-                screenText
+                screenText,
+                false
             )
         } else {
-            val limited = if (screenText.length > 400) screenText.substring(0, 400) else screenText
-            speak(limited)
+            speak(cut(screenText, 400))
         }
     }
 }

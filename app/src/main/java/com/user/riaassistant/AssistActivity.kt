@@ -10,6 +10,7 @@ class AssistActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         val serviceIntent = Intent(this, VoiceAssistantService::class.java)
+        serviceIntent.putExtra("start_conversation", true)
         startService(serviceIntent)
 
         finish()
